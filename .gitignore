@@ -1,0 +1,5 @@
+dist/
+*.kpz
+*.swp
+*~
+.DS_Store
