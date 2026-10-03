@@ -4,6 +4,8 @@ Koha plugin that writes **native Action Log** rows (`AUTH` / `SUCCESS` or `AUTH`
 
 Target tested against: **Koha 24.11.x** (requires the `auth_client_get_user` hook, available from 23.11.07+ / 24.05+).
 
+Current version: **1.2.0**
+
 ## Why this exists
 
 Koha’s `AuthSuccessLog` / `AuthFailureLog` system preferences log password checks in `C4::Auth::checkpw`. The OAuth/OIDC REST callback (`/api/v1/oauth/login/...` and `/api/v1/public/oauth/login/...`) uses `Koha::Auth::Client` and does **not** write those rows. This plugin fills that gap via the supported plugin hook `auth_client_get_user`.
@@ -26,13 +28,13 @@ From the repository root:
 
 ```bash
 ./scripts/build-kpz.sh
-# → dist/koha-plugin-oidc-authentication-logger-v1.1.0.kpz
+# → dist/koha-plugin-oidc-authentication-logger-v1.2.0.kpz
 ```
 
 Or manually:
 
 ```bash
-zip -r dist/OidcAuthenticationLogger-v1.1.0.kpz Koha
+zip -r dist/OidcAuthenticationLogger-v1.2.0.kpz Koha
 ```
 
 The archive root must contain `Koha/Plugin/...` (not a wrapper folder).
@@ -79,17 +81,22 @@ If the file is present but the Plugins list is empty for this class, re-run `ins
 
 ## What gets logged
 
-| Outcome | Module | Action | When |
-|---------|--------|--------|------|
-| IdP login with matched Koha patron | `AUTH` | `SUCCESS` | `auth_client_get_user` after mapping finds a patron |
-| IdP login, no matching patron | `AUTH` | `FAILURE` | Same hook when `patron` is undef |
+| Outcome | Module | Action | Interface column | When |
+|---------|--------|--------|------------------|------|
+| IdP login with matched Koha patron (OPAC) | `AUTH` | `SUCCESS` | `opac` | Hook finds patron |
+| IdP login with matched Koha patron (Staff) | `AUTH` | `SUCCESS` | `intranet` | Hook finds patron |
+| IdP login, no matching patron, auto-register will **not** run | `AUTH` | `FAILURE` | `opac` / `intranet` | True unmatched patron |
+| IdP login, no patron, domain **will** auto-register | *(no row)* | | | Avoids false `object=0` FAILURE before successful register |
 
-Staff and OPAC both use `Koha::Auth::Client::get_user`, so both interfaces are covered. The log info string includes provider code and interface (`intranet` / `opac`).
+Info strings include the OAuth interface label (`opac` or `staff`), e.g. `OIDC/OAuth login via provider 'google' (staff)`.
+
+Staff and OPAC both use `Koha::Auth::Client::get_user`. The plugin derives `opac` vs `staff` from the OAuth callback path (not `C4::Context->interface`, which is often stuck at the default `opac` for both routes).
 
 View under Tools → Log viewer (Auth), or:
 
 ```sql
-SELECT * FROM action_logs
+SELECT action_id, timestamp, user, module, action, object, info, interface
+  FROM action_logs
  WHERE module = 'AUTH'
    AND info LIKE 'OIDC/OAuth%'
  ORDER BY action_id DESC
@@ -105,7 +112,7 @@ Failures that never reach `get_user` are **not** logged here, including:
 
 Those still appear in the Plack/error log and as `auth_error` query params on redirect.
 
-If a domain **auto-registers** a patron after `get_user` returns with no patron, this plugin may still write a `FAILURE` for “no matching patron at hook time.”
+First-time **auto-register** logins intentionally produce **no** AUTH row at hook time (Koha creates the patron only after `get_user` returns). The next login for that patron will log `SUCCESS`. True unmatched patrons (auto-register off) still get `FAILURE` with `object = 0`.
 
 ## Uninstall
 
@@ -115,3 +122,4 @@ Disable/uninstall from Administration → Plugins, or remove the `.pm` and run `
 
 - Do **not** use `api_routes` / Mojolicious `after_dispatch` for this; that is the wrong extension point on 24.11.
 - Do not rename the `.pm` file or change the package without updating both to match.
+- v1.2.0 fixes: false `FAILURE`/`object=0` before auto-register; Staff vs OPAC interface labeling.
