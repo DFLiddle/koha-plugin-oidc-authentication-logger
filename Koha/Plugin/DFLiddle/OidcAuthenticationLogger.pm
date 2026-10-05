@@ -16,7 +16,7 @@ use base qw(Koha::Plugins::Base);
 use C4::Context;
 use C4::Log qw(logaction);
 
-our $VERSION = '1.2.0';
+our $VERSION = '1.3.0';
 
 our $metadata = {
     name            => 'OIDC Authentication Logger',
@@ -24,7 +24,7 @@ our $metadata = {
     author          => 'David F Liddle',
     description     => 'Logs OpenID Connect / OAuth IdP logins and unmatched patrons to Koha Action Logs (AUTH SUCCESS/FAILURE)',
     date_authored   => '2026-10-03',
-    date_updated    => '2026-10-03',
+    date_updated    => '2026-10-05',
     minimum_version => '23.11.07',
     maximum_version => undef,
     version         => $VERSION,
@@ -87,7 +87,12 @@ sub auth_client_get_user {
         # Avoid AUTH SUCCESS with object=0 when the patron object is unexpected.
         return unless defined $borrowernumber && $borrowernumber =~ /^\d+$/ && $borrowernumber > 0;
 
-        logaction(
+        # logaction stores action_logs.user from C4::Context->userenv->{number}
+        # (Log viewer "Librarian"), not from the object argument. OAuth callbacks
+        # run before a session exists, so userenv is unset and Librarian would
+        # stay 0 even when object is correct. Set userenv for this call only.
+        _logaction_as_user(
+            $borrowernumber,
             'AUTH',
             'SUCCESS',
             $borrowernumber,
@@ -104,6 +109,7 @@ sub auth_client_get_user {
             return;
         }
 
+        # FAILURE keeps user=0 (no known patron to attribute as Librarian).
         logaction(
             'AUTH',
             'FAILURE',
@@ -122,6 +128,40 @@ sub install {
 
 sub uninstall {
     return 1;
+}
+
+=head2 _logaction_as_user
+
+Call C4::Log::logaction with userenv temporarily set so action_logs.user
+(Librarian column) is $borrowernumber. Restores the previous userenv afterward.
+Does not leave a lasting session identity.
+
+=cut
+
+sub _logaction_as_user {
+    my ( $borrowernumber, @log_args ) = @_;
+
+    my $previous = C4::Context->userenv;
+    my $had_env  = ( ref($previous) eq 'HASH' );
+
+    if ($had_env) {
+
+        # Prefer in-place override so we do not replace other userenv fields.
+        my $prev_number = $previous->{number};
+        $previous->{number} = $borrowernumber;
+        my $ok = eval { logaction(@log_args); 1 };
+        my $err = $@;
+        $previous->{number} = $prev_number;
+        die $err if !$ok;
+        return;
+    }
+
+    C4::Context->set_userenv($borrowernumber);
+    my $ok = eval { logaction(@log_args); 1 };
+    my $err = $@;
+    C4::Context->unset_userenv;
+    die $err if !$ok;
+    return;
 }
 
 sub _provider_code {
