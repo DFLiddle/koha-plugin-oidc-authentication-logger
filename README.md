@@ -4,7 +4,7 @@ Koha plugin that writes **native Action Log** rows (`AUTH` / `SUCCESS` or `AUTH`
 
 Target tested against: **Koha 24.11.x** (requires the `auth_client_get_user` hook, available from 23.11.07+ / 24.05+).
 
-Current version: **1.3.0**
+Current version: **1.3.1**
 
 ## Why this exists
 
@@ -28,13 +28,13 @@ From the repository root:
 
 ```bash
 ./scripts/build-kpz.sh
-# → dist/koha-plugin-oidc-authentication-logger-v1.3.0.kpz
+# → dist/koha-plugin-oidc-authentication-logger-v1.3.1.kpz
 ```
 
 Or manually:
 
 ```bash
-zip -r dist/OidcAuthenticationLogger-v1.3.0.kpz Koha
+zip -r dist/OidcAuthenticationLogger-v1.3.1.kpz Koha
 ```
 
 The archive root must contain `Koha/Plugin/...` (not a wrapper folder).
@@ -90,7 +90,7 @@ If the file is present but the Plugins list is empty for this class, re-run `ins
 
 Info strings include the OAuth interface label (`opac` or `staff`), e.g. `OIDC/OAuth login via provider 'google' (staff)`.
 
-Staff and OPAC both use `Koha::Auth::Client::get_user`. The plugin derives `opac` vs `staff` from the OAuth callback path (not `C4::Context->interface`, which is often stuck at the default `opac` for both routes).
+Staff and OPAC both use `Koha::Auth::Client::get_user`. The plugin takes `opac` vs `staff` from the OAuth route parameter that Koha already passes into `get_user` (captured around the hook). It does **not** trust `C4::Context->interface`, which can remain `intranet` after a Staff login on the same Plack worker while an OPAC OAuth callback runs (OAuth skips `authenticate_api_request`, and UserEnv middleware only clears userenv).
 
 On SUCCESS, both `object` and `user` (Log viewer **Librarian**) are set to the patron’s borrowernumber so the viewer can resolve the display name. `C4::Log::logaction` normally takes `user` from `userenv`, which is empty during OAuth callbacks; the plugin sets it for that call only.
 
@@ -126,3 +126,4 @@ Disable/uninstall from Administration → Plugins, or remove the `.pm` and run `
 - Do not rename the `.pm` file or change the package without updating both to match.
 - v1.2.0 fixes: false `FAILURE`/`object=0` before auto-register; Staff vs OPAC interface labeling.
 - v1.3.0 fixes: SUCCESS rows set `action_logs.user` (Librarian) to the matched borrowernumber, not `0`.
+- v1.3.1 fixes: OPAC OIDC SUCCESS after a prior Staff login in the same browser no longer inherits Staff/`intranet` from polluted `C4::Context->interface`; interface comes from the OAuth route param.

@@ -16,7 +16,7 @@ use base qw(Koha::Plugins::Base);
 use C4::Context;
 use C4::Log qw(logaction);
 
-our $VERSION = '1.3.0';
+our $VERSION = '1.3.1';
 
 our $metadata = {
     name            => 'OIDC Authentication Logger',
@@ -29,6 +29,11 @@ our $metadata = {
     maximum_version => undef,
     version         => $VERSION,
 };
+
+# Captured from Koha::Auth::Client::get_user's $params->{interface} for the
+# duration of that call. Preferred over %ENV path parsing and Context->interface.
+our $CurrentOAuthInterface;
+our $_get_user_patched = 0;
 
 =head1 NAME
 
@@ -51,6 +56,7 @@ sub new {
     $args->{metadata} = $metadata;
     $args->{metadata}->{class} = $class;
     my $self = $class->SUPER::new($args);
+    _patch_get_user_interface_capture();
     return $self;
 }
 
@@ -67,6 +73,9 @@ Does not mutate mapped_data or patron.
 sub auth_client_get_user {
     my ( $self, $args ) = @_;
     $args ||= {};
+
+    # Ensure capture is installed even if this class was loaded without new().
+    _patch_get_user_interface_capture();
 
     my $patron   = $args->{patron};
     my $provider = $args->{provider};
@@ -123,11 +132,44 @@ sub auth_client_get_user {
 }
 
 sub install {
+    _patch_get_user_interface_capture();
     return 1;
 }
 
 sub uninstall {
     return 1;
+}
+
+=head2 _patch_get_user_interface_capture
+
+Wrap C<Koha::Auth::Client::get_user> so the OAuth route's C<interface>
+parameter (C<opac>|C<staff>) is available while C<auth_client_get_user> runs.
+
+Koha passes C<interface> into C<get_user> but does not include it in the hook
+C<$args>. Under Plack/Mojolicious, C<%ENV> path parsing is unreliable, and
+C<C4::Context-E<gt>interface> can remain C<intranet> after a Staff request
+because OAuth skips C<authenticate_api_request> (which would set C<api>) and
+C<Koha::Middleware::UserEnv> only clears userenv, not interface.
+
+=cut
+
+sub _patch_get_user_interface_capture {
+    return if $_get_user_patched;
+
+    # Soft-fail if Auth::Client is not loadable in this process yet.
+    eval { require Koha::Auth::Client; 1 } or return;
+
+    my $orig = \&Koha::Auth::Client::get_user;
+    no warnings 'redefine';
+    *Koha::Auth::Client::get_user = sub {
+        my ( $self, $params ) = @_;
+        local $CurrentOAuthInterface =
+            ( ref($params) eq 'HASH' ) ? $params->{interface} : undef;
+        return $orig->( $self, $params );
+    };
+
+    $_get_user_patched = 1;
+    return;
 }
 
 =head2 _logaction_as_user
@@ -187,26 +229,58 @@ sub _identity_label {
 
 Resolve the OAuth login interface (C<opac> or C<staff>).
 
-C4::Context->interface is unreliable here: OAuth routes skip
-authenticate_api_request, so Context often stays at the default C<opac>
-for both Staff and OPAC callbacks. The route path ends in /opac or /staff.
+Preferred source: C<$CurrentOAuthInterface> captured from
+C<Koha::Auth::Client::get_user>'s C<< $params->{interface} >> (the OpenAPI
+path parameter), which is authoritative and independent of session/userenv.
+
+Fallbacks (best-effort): request path, then C</public/> vs non-public OAuth
+URL shape. C<C4::Context-E<gt>interface> is B<not> trusted here: after a Staff
+login on the same Plack worker it can remain C<intranet> while an OPAC OAuth
+callback runs.
 
 =cut
 
 sub _oauth_interface {
-    my $path = $ENV{PATH_INFO} // $ENV{REQUEST_URI} // '';
-    if ( $path =~ m{/oauth/login/[^/]+/(opac|staff)\b} ) {
+    if ( defined $CurrentOAuthInterface && $CurrentOAuthInterface =~ /^(opac|staff)$/ ) {
+        return $CurrentOAuthInterface;
+    }
+
+    my $path = _request_path();
+
+    # Explicit route suffix (…/oauth/login/<provider>/(opac|staff)).
+    if ( $path =~ m{/oauth/login/[^/]+/(opac|staff)(?:\b|\?|$)} ) {
         return $1;
     }
+
+    # Bug 33708: OPAC uses /api/v1/public/oauth/… ; Staff uses /api/v1/oauth/…
+    if ( $path =~ m{/public/oauth/} ) {
+        return 'opac';
+    }
+    if ( $path =~ m{/oauth/login/} && $path !~ m{/public/} ) {
+        return 'staff';
+    }
+
     if ( $path =~ m{/(opac|staff)(?:\?|$)} ) {
         return $1;
     }
 
-    # Last resort: Context (often wrong for staff OAuth on 24.11).
-    my $ctx = C4::Context->interface // '';
-    return 'opac'     if $ctx eq 'opac';
-    return 'staff'    if $ctx eq 'intranet' || $ctx eq 'staff';
     return 'unknown';
+}
+
+=head2 _request_path
+
+Best-effort request path for fallbacks. Prefer non-empty values; under
+Mojolicious/Plack these C<%ENV> keys are often unset or stale.
+
+=cut
+
+sub _request_path {
+    for my $key (qw(REQUEST_URI PATH_INFO SCRIPT_URL HTTP_X_ORIGINAL_URI HTTP_X_REWRITE_URL)) {
+        my $value = $ENV{$key};
+        next unless defined $value && length $value;
+        return $value;
+    }
+    return '';
 }
 
 =head2 _log_interface
@@ -220,7 +294,10 @@ sub _log_interface {
     my ($oauth_iface) = @_;
     return 'opac'     if $oauth_iface eq 'opac';
     return 'intranet' if $oauth_iface eq 'staff';
-    return C4::Context->interface // 'api';
+
+    # Do not fall back to Context->interface: it can be leftover intranet from
+    # a prior Staff request on the same Plack worker (OAuth skips setting api).
+    return 'api';
 }
 
 =head2 _will_auto_register
